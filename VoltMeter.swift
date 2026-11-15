@@ -94,7 +94,10 @@ struct ChannelLevel {
     var clipped = false
 
     /// What the meter actually shows; used to skip redraws that would change nothing.
-    var displayKey: [Int] { [Int((max(peakDB, -61) * 2).rounded()), Int((max(holdDB, -61) * 10).rounded()), clipped ? 1 : 0] }
+    var displayKey: [Int] {
+        // lit segment count (38 across -60..0), hold readout to 0.1 dB, clip lamp
+        [Int(((max(peakDB, -61) + 60) / 60 * 38).rounded(.down)), Int((max(holdDB, -61) * 10).rounded()), clipped ? 1 : 0]
+    }
 }
 
 /// Live levels live in their own object so 30 Hz meter updates redraw only the meter rows,
@@ -392,16 +395,28 @@ struct LEDMeter: View {
         let width = u(340)
         Button(action: reset) {
             VStack(spacing: u(4)) {
-                HStack(spacing: u(2)) {
-                    ForEach(0..<Self.segments, id: \.self) { i in
+                // one Canvas instead of 38 views with their own shadows: far cheaper at 30 fps
+                Canvas { ctx, size in
+                    let gap = u(2), n = CGFloat(Self.segments)
+                    let w = (size.width - gap * (n - 1)) / n
+                    var lit: [(CGRect, Color)] = []
+                    for i in 0..<Self.segments {
                         let t = db(of: i)
                         let color = t > -1.6 ? Palette.red : t > -7 ? Palette.amber : Palette.lime
                         let isHold = live && level.holdDB > -60 && abs(level.holdDB - t) < 60 / Float(Self.segments) / 2 + 0.01
-                        let lit = live && (level.peakDB >= t - 0.01 || isHold || (i == Self.segments - 1 && level.clipped))
-                        RoundedRectangle(cornerRadius: u(1.5))
-                            .fill(lit ? color : color.opacity(0.14))
-                            .shadow(color: lit ? color.opacity(0.55) : .clear, radius: u(3))
+                        let on = live && (level.peakDB >= t - 0.01 || isHold || (i == Self.segments - 1 && level.clipped))
+                        let r = CGRect(x: CGFloat(i) * (w + gap), y: 0, width: w, height: size.height)
+                        if on { lit.append((r, color)) } else {
+                            ctx.fill(Path(roundedRect: r, cornerRadius: u(1.5)), with: .color(color.opacity(0.14)))
+                        }
                     }
+                    guard !lit.isEmpty else { return }
+                    ctx.drawLayer { glow in
+                        glow.addFilter(.blur(radius: u(3)))
+                        glow.opacity = 0.55
+                        for (r, c) in lit { glow.fill(Path(roundedRect: r, cornerRadius: u(1.5)), with: .color(c)) }
+                    }
+                    for (r, c) in lit { ctx.fill(Path(roundedRect: r, cornerRadius: u(1.5)), with: .color(c)) }
                 }
                 .frame(width: width, height: u(20))
                 .padding(u(3))
