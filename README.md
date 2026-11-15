@@ -73,8 +73,32 @@ swift icon.swift && iconutil -c icns AppIcon.iconset -o AppIcon.icns
 ## Good to know
 
 - **Press any button on the Volt once after launch.** The device does not answer "what is your state?" requests, so the app learns the state from the first button change. Until then the controls are locked, so the app never overwrites settings it has not seen.
-- **Button control is mapped for the Volt 2 only.** Volt 1, 176, 276 and 476 should get working meters, but their panels may use different bits. PRs with captures from other models are very welcome.
+- **Button control is mapped for the Volt 2 only.** Other Volts should get working meters, but their buttons and channel counts may differ.
 - Close it from the red x that appears when you hover over the logo, or from the menu bar icon.
+
+## Got a different Volt? Help map it
+
+The Volt family has six models, and only one is fully supported so far:
+
+| Model      | Meters             | Button control |
+|------------|--------------------|----------------|
+| Volt 1     | should work        | not mapped     |
+| Volt 2     | yes                | yes            |
+| Volt 176   | should work        | not mapped     |
+| Volt 276   | should work        | not mapped     |
+| Volt 476   | should work (2 ch) | not mapped     |
+| Volt 476P  | should work (2 ch) | not mapped     |
+
+If you own one of the others, you are warmly invited to add proper support so the app shows exactly your panel: the right number of inputs, the buttons your model has (the 76 models add the Vintage compressor, the 476 has four inputs), and the correct bits for each one.
+
+The recipe is the same one used for the Volt 2:
+
+1. Find your model's USB product ID (`ioreg -p IOUSB -l | grep -A5 Volt`) and check that it has a vendor HID interface (usage page `0xFF01`).
+2. Log input report 1 while you press each front-panel button one at a time, and note which bit changes.
+3. Confirm writing works by sending output report `0x10` with one bit flipped. **Do not write to reports `0xE0` to `0xF0`**; they look like factory and serial data.
+4. Add the model's map to `VoltMeter.swift` and open a PR, ideally with a screenshot and your raw captures.
+
+Even just opening an issue with your captures helps a lot.
 
 ## Disclaimer
 
