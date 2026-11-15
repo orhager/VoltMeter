@@ -100,10 +100,20 @@ struct ChannelLevel {
     }
 }
 
-/// Live levels live in their own object so 30 Hz meter updates redraw only the meter rows,
-/// not the whole app (the menu bar scene observes `Meter`).
-final class Levels: ObservableObject {
-    @Published var ch = [ChannelLevel(), ChannelLevel()]
+/// Live levels bypass SwiftUI: Meter hands them to the AppKit strip and readout views directly,
+/// so a moving meter never re-renders the SwiftUI view graph.
+final class Levels {
+    private(set) var ch = [ChannelLevel(), ChannelLevel()]
+    private(set) var live = false
+    private var strips: [MeterStrip?] = [nil, nil]
+    private var readouts: [ReadoutLabel?] = [nil, nil]
+
+    func show(_ ch: [ChannelLevel], live: Bool) {
+        self.ch = ch; self.live = live
+        for c in 0..<2 { strips[c]?.show(ch[c], live: live); readouts[c]?.show(ch[c], live: live) }
+    }
+    func attach(strip: MeterStrip, _ c: Int) { strips[c] = strip; strip.show(ch[c], live: live) }
+    func attach(readout: ReadoutLabel, _ c: Int) { readouts[c] = readout; readout.show(ch[c], live: live) }
 }
 
 final class Meter: ObservableObject {
@@ -115,7 +125,7 @@ final class Meter: ObservableObject {
     private var pending: [Float] = [0, 0]
     private var ticker: Timer?
     @Published var status = "Waiting for microphone access"
-    @Published var live = false
+    @Published var live = false { didSet { levels.show(ch, live: live) } }
 
     // Reads the Volt 2 straight from the HAL with an IOProc. AVAudioEngine stalled
     // after one buffer when its input was switched to the Volt, so it is not used.
@@ -144,7 +154,7 @@ final class Meter: ObservableObject {
 
     func resetClips() {
         for i in ch.indices { ch[i].clipped = false }
-        levels.ch = ch
+        levels.show(ch, live: live)
         anyClip = false
     }
 
@@ -189,10 +199,11 @@ final class Meter: ObservableObject {
         guard let dev = voltDeviceID() else { status = "Plug in the Volt 2"; live = false; return }
 
         var proc: AudioDeviceIOProcID?
+        let debug = ProcessInfo.processInfo.environment["VM_DEBUG"] != nil
         let err = AudioDeviceCreateIOProcIDWithBlock(&proc, dev, ioQueue) { [weak self] _, inData, _, _, _ in
             guard let self else { return }
             let abl = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: inData))
-            var peaks: [Float] = [0, 0]
+            var p0: Float = 0, p1: Float = 0   // locals, no array allocation on the audio thread
             var chanBase = 0
             // works for both interleaved (1 buffer x N ch) and planar (N buffers x 1 ch) layouts
             for b in abl {
@@ -202,15 +213,15 @@ final class Meter: ObservableObject {
                 let total = Int(b.mDataByteSize) / MemoryLayout<Float>.size
                 for i in 0..<total {
                     let c = chanBase + i % max(nch, 1)
-                    if c < 2 { peaks[c] = max(peaks[c], abs(s[i])) }
+                    if c == 0 { p0 = max(p0, abs(s[i])) } else if c == 1 { p1 = max(p1, abs(s[i])) }
                 }
                 chanBase += nch
             }
-            if ProcessInfo.processInfo.environment["VM_DEBUG"] != nil {
-                FileHandle.standardError.write("bufs=\(abl.count) ch=\(abl.first?.mNumberChannels ?? 0) bytes=\(abl.first?.mDataByteSize ?? 0) peaks=\(peaks)\n".data(using: .utf8)!)
+            if debug {
+                FileHandle.standardError.write("bufs=\(abl.count) ch=\(abl.first?.mNumberChannels ?? 0) bytes=\(abl.first?.mDataByteSize ?? 0) peaks=\([p0, p1])\n".data(using: .utf8)!)
             }
             self.peakLock.lock()
-            self.pending[0] = max(self.pending[0], peaks[0]); self.pending[1] = max(self.pending[1], peaks[1])
+            self.pending[0] = max(self.pending[0], p0); self.pending[1] = max(self.pending[1], p1)
             self.peakLock.unlock()
         }
         guard err == noErr, let proc else { status = "Audio error \(err)"; return }
@@ -290,7 +301,7 @@ final class Meter: ObservableObject {
         if clip != anyClip { anyClip = clip }
         // nothing to draw when the panel is hidden or covered, or when nothing visibly moved
         guard FloatingPanel.shared.isOnScreen else { return }
-        if ch.map(\.displayKey) != levels.ch.map(\.displayKey) { levels.ch = ch }
+        if ch.map(\.displayKey) != levels.ch.map(\.displayKey) || levels.live != live { levels.show(ch, live: live) }
     }
 }
 
@@ -381,47 +392,145 @@ struct Key: View {
 }
 
 /// Segmented LED meter, -60 to 0 dBFS, linear in dB to match the scale under it.
+/// Pre-blurred LED glows, rendered once per colour and size and reused every frame.
+@MainActor enum Glow {
+    static var pad: CGFloat { u(9) }
+    static let colors = [Palette.lime, Palette.amber, Palette.red]
+    private static var cache: [CGImage] = []
+    private static var cachedSize: CGSize = .zero
+    /// glows for lime, amber, red at this segment size
+    static func images(_ size: CGSize) -> [CGImage] {
+        if size == cachedSize, !cache.isEmpty { return cache }
+        cache = colors.compactMap { render($0, size) }
+        cachedSize = size
+        return cache
+    }
+    private static func render(_ color: Color, _ size: CGSize) -> CGImage? {
+        let view = RoundedRectangle(cornerRadius: u(1.5)).fill(color)
+            .frame(width: size.width, height: size.height)
+            .blur(radius: u(3))
+            .frame(width: size.width + pad * 2, height: size.height + pad * 2)
+        let r = ImageRenderer(content: view)
+        r.scale = 2
+        return r.cgImage
+    }
+}
+
+/// The 38-segment LED strip as plain Core Animation layers. Meter pushes levels straight
+/// into it, so a moving meter flips a few layers and SwiftUI does no work at all.
+final class MeterStrip: NSView {
+    static let segments = 38
+    static func db(of i: Int) -> Float { -60 + 60 * Float(i + 1) / Float(segments) }
+    static func colorIndex(_ i: Int) -> Int { let t = db(of: i); return t > -1.6 ? 2 : t > -7 ? 1 : 0 }
+
+    private var glows: [CALayer] = []
+    private var lamps: [CALayer] = []
+    private var shown = [Bool](repeating: false, count: segments)
+
+    override var isFlipped: Bool { true }
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }   // clicks go to the SwiftUI button
+
+    init(size: CGSize) {
+        super.init(frame: CGRect(origin: .zero, size: size))
+        wantsLayer = true
+        guard let root = layer else { return }
+        root.masksToBounds = false
+        let gap = u(2), n = CGFloat(Self.segments)
+        let seg = CGSize(width: (size.width - gap * (n - 1)) / n, height: size.height)
+        let images = MainActor.assumeIsolated { Glow.images(seg) }
+        var offs: [CALayer] = []
+        for i in 0..<Self.segments {
+            let k = Self.colorIndex(i)
+            let color = NSColor(Glow.colors[k])
+            let r = CGRect(x: CGFloat(i) * (seg.width + gap), y: 0, width: seg.width, height: seg.height)
+            let off = CALayer(); off.frame = r; off.cornerRadius = u(1.5)
+            off.backgroundColor = color.withAlphaComponent(0.14).cgColor
+            let glow = CALayer(); glow.frame = r.insetBy(dx: -Glow.pad, dy: -Glow.pad)
+            glow.contents = images.indices.contains(k) ? images[k] : nil
+            glow.opacity = 0.55; glow.isHidden = true
+            let lamp = CALayer(); lamp.frame = r; lamp.cornerRadius = u(1.5)
+            lamp.backgroundColor = color.cgColor; lamp.isHidden = true
+            offs.append(off); glows.append(glow); lamps.append(lamp)
+        }
+        // all unlit segments, then every glow, then the lit lamps on top
+        (offs + glows + lamps).forEach(root.addSublayer)
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    func show(_ level: ChannelLevel, live: Bool) {
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        for i in 0..<Self.segments {
+            let t = Self.db(of: i)
+            let isHold = live && level.holdDB > -60 && abs(level.holdDB - t) < 60 / Float(Self.segments) / 2 + 0.01
+            let on = live && (level.peakDB >= t - 0.01 || isHold || (i == Self.segments - 1 && level.clipped))
+            if on != shown[i] { shown[i] = on; glows[i].isHidden = !on; lamps[i].isHidden = !on }
+        }
+        CATransaction.commit()
+    }
+}
+
+/// The big dB readout, also fed directly by Meter.
+final class ReadoutLabel: NSTextField {
+    private var current = ""
+    static func font() -> NSFont { .monospacedDigitSystemFont(ofSize: u(30), weight: .bold) }
+    convenience init() {
+        self.init(labelWithString: "")
+        isEditable = false; isSelectable = false; drawsBackground = false; isBordered = false
+        lineBreakMode = .byClipping
+    }
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    func show(_ level: ChannelLevel, live: Bool) {
+        let active = live && level.holdDB > -60
+        let number = level.clipped ? "Clip"
+            : active ? String(format: "%.1f", level.holdDB).replacingOccurrences(of: "-", with: "\u{2212}")
+            : "\u{2212}\u{221E}"
+        let key = number + (level.clipped ? "c" : active ? "a" : "i")
+        guard key != current else { return }
+        current = key
+        let color = level.clipped ? NSColor(Palette.red) : NSColor(Palette.ink).withAlphaComponent(active ? 1 : 0.5)
+        let text = NSMutableAttributedString(string: number, attributes: [.font: Self.font(), .foregroundColor: color])
+        text.append(NSAttributedString(string: " dB", attributes: [
+            .font: NSFont.systemFont(ofSize: u(16), weight: .medium), .foregroundColor: NSColor(Palette.inkDim)]))
+        attributedStringValue = text
+    }
+}
+
+/// Bridges the AppKit meter pieces into SwiftUI and registers them with `Levels`.
+struct StripView: NSViewRepresentable {
+    let levels: Levels
+    let channel: Int
+    let size: CGSize
+    func makeNSView(context: Context) -> MeterStrip {
+        let v = MeterStrip(size: size); levels.attach(strip: v, channel); return v
+    }
+    func updateNSView(_ nsView: MeterStrip, context: Context) {}
+}
+
+struct ReadoutView: NSViewRepresentable {
+    let levels: Levels
+    let channel: Int
+    func makeNSView(context: Context) -> ReadoutLabel {
+        let v = ReadoutLabel(); levels.attach(readout: v, channel); return v
+    }
+    func updateNSView(_ nsView: ReadoutLabel, context: Context) {}
+}
+
 struct LEDMeter: View {
-    let level: ChannelLevel
-    let live: Bool
+    let levels: Levels
+    let channel: Int
     let reset: () -> Void
 
-    static let segments = 38
     static let marks: [Int] = [-60, -48, -36, -24, -12, 0]
-
-    private func db(of i: Int) -> Float { -60 + 60 * Float(i + 1) / Float(Self.segments) }
 
     var body: some View {
         let width = u(340)
         Button(action: reset) {
             VStack(spacing: u(4)) {
-                // one Canvas instead of 38 views with their own shadows: far cheaper at 30 fps
-                Canvas { ctx, size in
-                    let gap = u(2), n = CGFloat(Self.segments)
-                    let w = (size.width - gap * (n - 1)) / n
-                    var lit: [(CGRect, Color)] = []
-                    for i in 0..<Self.segments {
-                        let t = db(of: i)
-                        let color = t > -1.6 ? Palette.red : t > -7 ? Palette.amber : Palette.lime
-                        let isHold = live && level.holdDB > -60 && abs(level.holdDB - t) < 60 / Float(Self.segments) / 2 + 0.01
-                        let on = live && (level.peakDB >= t - 0.01 || isHold || (i == Self.segments - 1 && level.clipped))
-                        let r = CGRect(x: CGFloat(i) * (w + gap), y: 0, width: w, height: size.height)
-                        if on { lit.append((r, color)) } else {
-                            ctx.fill(Path(roundedRect: r, cornerRadius: u(1.5)), with: .color(color.opacity(0.14)))
-                        }
-                    }
-                    guard !lit.isEmpty else { return }
-                    ctx.drawLayer { glow in
-                        glow.addFilter(.blur(radius: u(3)))
-                        glow.opacity = 0.55
-                        for (r, c) in lit { glow.fill(Path(roundedRect: r, cornerRadius: u(1.5)), with: .color(c)) }
-                    }
-                    for (r, c) in lit { ctx.fill(Path(roundedRect: r, cornerRadius: u(1.5)), with: .color(c)) }
-                }
-                .frame(width: width, height: u(20))
-                .padding(u(3))
-                .background(RoundedRectangle(cornerRadius: u(4)).fill(Palette.well))
-                .transaction { $0.animation = nil }
+                StripView(levels: levels, channel: channel, size: CGSize(width: width, height: u(20)))
+                    .frame(width: width, height: u(20))
+                    .padding(u(3))
+                    .background(RoundedRectangle(cornerRadius: u(4)).fill(Palette.well))
                 // scale
                 ZStack(alignment: .topLeading) {
                     ForEach(Self.marks, id: \.self) { m in
@@ -437,16 +546,16 @@ struct LEDMeter: View {
                 }
                 .frame(width: width + u(6), height: u(20), alignment: .topLeading)
             }
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .help(level.clipped ? "Clipped. Click to clear." : "Input level")
+        .help("Input level. Click to clear the clip lamp.")
     }
 }
 
 struct ChannelRow: View {
     let index: Int
-    let level: ChannelLevel
-    let live: Bool
+    let levels: Levels
     let vintage: Bool
     let inst: Bool
     let enabled: Bool
@@ -460,18 +569,10 @@ struct ChannelRow: View {
                 Text("Input \(index)").font(.ui(22, .semibold)).foregroundStyle(Palette.ink)
                     .frame(width: u(88), alignment: .leading)
                 VRule()
-                HStack(alignment: .firstTextBaseline, spacing: u(4)) {
-                    Text(level.clipped ? "Clip"
-                         : live && level.holdDB > -60 ? String(format: "%.1f", level.holdDB).replacingOccurrences(of: "-", with: "\u{2212}")
-                         : "\u{2212}\u{221E}")
-                        .font(.ui(30, .bold).monospacedDigit())
-                        .foregroundStyle(level.clipped ? Palette.red : Palette.ink.opacity(live && level.holdDB > -60 ? 1 : 0.5))
-                    Text("dB").font(.ui(16, .medium)).foregroundStyle(Palette.inkDim)
-                }
-                .frame(width: u(128), alignment: .leading)
-                .transaction { $0.animation = nil }
+                ReadoutView(levels: levels, channel: index - 1)
+                    .frame(width: u(128), height: u(38), alignment: .leading)
                 VRule()
-                LEDMeter(level: level, live: live, reset: reset)
+                LEDMeter(levels: levels, channel: index - 1, reset: reset)
                     .padding(.top, u(14))
                 Spacer(minLength: u(6))
                 Key(title: "Vintage", on: vintage, color: Palette.amber, enabled: enabled, width: 92, action: toggleVintage)
@@ -605,7 +706,7 @@ struct Faceplate: View {
             Rectangle().fill(Palette.rule).frame(height: u(1))
 
             VStack(spacing: u(10)) {
-                InputRows(levels: meter.levels, live: meter.live, enabled: ok, reset: meter.resetClips)
+                InputRows(levels: meter.levels, enabled: ok, reset: meter.resetClips)
                 Card {
                     HStack(spacing: u(18)) {
                         Text("Phantom Power").font(.ui(20, .semibold)).foregroundStyle(Palette.ink)
@@ -626,19 +727,18 @@ struct Faceplate: View {
     }
 }
 
-/// The two input rows. Only this view observes the live levels.
+/// The two input rows. Their meters are fed by `Levels` directly, outside SwiftUI.
 struct InputRows: View {
-    @ObservedObject var levels: Levels
+    let levels: Levels
     @EnvironmentObject var panel: VoltPanel
-    let live: Bool
     let enabled: Bool
     let reset: () -> Void
 
     var body: some View {
-        ChannelRow(index: 1, level: levels.ch[0], live: live, vintage: panel.vintage1, inst: panel.inst1,
+        ChannelRow(index: 1, levels: levels, vintage: panel.vintage1, inst: panel.inst1,
                    enabled: enabled, reset: reset,
                    toggleVintage: { panel.toggle(0x40) }, toggleInst: { panel.toggle(0x10) })
-        ChannelRow(index: 2, level: levels.ch[1], live: live, vintage: panel.vintage2, inst: panel.inst2,
+        ChannelRow(index: 2, levels: levels, vintage: panel.vintage2, inst: panel.inst2,
                    enabled: enabled, reset: reset,
                    toggleVintage: { panel.toggle(0x80) }, toggleInst: { panel.toggle(0x20) })
     }
