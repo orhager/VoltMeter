@@ -614,32 +614,57 @@ struct DirectSwitch: View {
     }
 }
 
-/// Signal-bars mark in the header. Doubles as quit: it turns into a red x on hover.
-struct HeaderMark: View {
-    let live: Bool
+/// Close, minimize and resize, drawn like the standard macOS window buttons.
+/// Close hides the panel (bring it back from the Dock or the menu bar), minimize sends it
+/// to the Dock, and the green button steps through 100%, 150% and 200%.
+struct TrafficLights: View {
+    @EnvironmentObject var meter: Meter
+    @EnvironmentObject var panel: VoltPanel
     @State private var hover = false
+
     var body: some View {
-        Button { NSApp.terminate(nil) } label: {
+        HStack(spacing: u(8)) {
+            light(Color(red: 1.00, green: 0.37, blue: 0.34), "xmark", "Hide meter") { FloatingPanel.shared.hide() }
+            light(Color(red: 1.00, green: 0.74, blue: 0.18), "minus", "Minimize") { FloatingPanel.shared.minimize() }
+            light(Color(red: 0.16, green: 0.78, blue: 0.25), "plus", "Next size") {
+                let sizes = FloatingPanel.sizes
+                let next = sizes[((sizes.firstIndex(of: FloatingPanel.scale) ?? 0) + 1) % sizes.count]
+                FloatingPanel.shared.setScale(next, meter: meter, panel: panel)
+            }
+        }
+        .padding(.vertical, u(4))
+        .contentShape(Rectangle())
+        .onHover { hover = $0 }
+    }
+
+    private func light(_ color: Color, _ glyph: String, _ help: String, _ action: @escaping () -> Void) -> some View {
+        Button(action: action) {
             ZStack {
+                Circle().fill(color)
+                Circle().strokeBorder(.black.opacity(0.18), lineWidth: u(0.5))
                 if hover {
-                    Circle().fill(Palette.red).frame(width: u(18), height: u(18))
-                    Image(systemName: "xmark").font(.system(size: u(8), weight: .heavy)).foregroundStyle(.black.opacity(0.75))
-                } else {
-                    HStack(alignment: .bottom, spacing: u(2.5)) {
-                        ForEach(0..<4, id: \.self) { i in
-                            RoundedRectangle(cornerRadius: u(1))
-                                .fill(live ? Palette.lime : Palette.inkDim)
-                                .frame(width: u(3.5), height: u(5 + CGFloat(i) * 4))
-                        }
-                    }
+                    Image(systemName: glyph).font(.system(size: u(7), weight: .black)).foregroundStyle(.black.opacity(0.55))
                 }
             }
-            .frame(width: u(24), height: u(22))
-            .contentShape(Rectangle())
+            .frame(width: u(12), height: u(12))
         }
         .buttonStyle(.plain)
-        .onHover { hover = $0 }
-        .help("Quit VoltMeter")
+        .help(help)
+    }
+}
+
+/// Signal-bars mark in the header, lit while the Volt is streaming.
+struct HeaderMark: View {
+    let live: Bool
+    var body: some View {
+        HStack(alignment: .bottom, spacing: u(2.5)) {
+            ForEach(0..<4, id: \.self) { i in
+                RoundedRectangle(cornerRadius: u(1))
+                    .fill(live ? Palette.lime : Palette.inkDim)
+                    .frame(width: u(3.5), height: u(5 + CGFloat(i) * 4))
+            }
+        }
+        .frame(width: u(24), height: u(22))
     }
 }
 
@@ -686,6 +711,8 @@ struct Faceplate: View {
         VStack(spacing: 0) {
             // header
             HStack(spacing: u(14)) {
+                TrafficLights()
+                    .padding(.trailing, u(6))
                 HeaderMark(live: meter.live)
                 Text("VoltMeter").font(.ui(25, .semibold)).kerning(u(-0.3)).foregroundStyle(Palette.ink)
                 Spacer()
@@ -757,10 +784,13 @@ final class FloatingPanel {
     }
 
     func show(meter: Meter, panel: VoltPanel) {
-        if let w = window { w.orderFrontRegardless(); return }
+        if let w = window {
+            if w.isMiniaturized { w.deminiaturize(nil) }
+            w.orderFrontRegardless(); return
+        }
         let host = makeHost(meter: meter, panel: panel)
         let w = NSPanel(contentRect: NSRect(origin: .zero, size: host.fittingSize),
-                        styleMask: [.borderless, .nonactivatingPanel],
+                        styleMask: [.borderless, .nonactivatingPanel, .miniaturizable],
                         backing: .buffered, defer: false)
         w.isOpaque = false
         w.backgroundColor = .clear
@@ -816,6 +846,7 @@ final class FloatingPanel {
     }
 
     func hide() { window?.orderOut(nil) }
+    func minimize() { window?.miniaturize(nil) }
     func toggle(meter: Meter, panel: VoltPanel) { isVisible ? hide() : show(meter: meter, panel: panel) }
 }
 

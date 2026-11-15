@@ -74,7 +74,7 @@ swift icon.swift && iconutil -c icns AppIcon.iconset -o AppIcon.icns
 
 - **Press any button on the Volt once after launch.** The device does not answer "what is your state?" requests, so the app learns the state from the first button change. Until then the controls are locked, so the app never overwrites settings it has not seen.
 - **Button control is mapped for the Volt 2 only.** Other Volts should get working meters, but their buttons and channel counts may differ.
-- Close it from the red x that appears when you hover over the logo, or from the menu bar icon.
+- The three window buttons work like any Mac app: red hides the panel, yellow minimizes it to the Dock, green steps through 100%, 150% and 200%. Click the Dock icon or the menu bar icon to bring it back, and quit from the menu bar icon or by right-clicking the panel.
 
 ## Got a different Volt? Help map it
 
