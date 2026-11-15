@@ -92,10 +92,25 @@ struct ChannelLevel {
     var holdDB: Float = -120
     var holdUntil = Date.distantPast
     var clipped = false
+
+    /// What the meter actually shows; used to skip redraws that would change nothing.
+    var displayKey: [Int] { [Int((max(peakDB, -61) * 2).rounded()), Int((max(holdDB, -61) * 10).rounded()), clipped ? 1 : 0] }
+}
+
+/// Live levels live in their own object so 30 Hz meter updates redraw only the meter rows,
+/// not the whole app (the menu bar scene observes `Meter`).
+final class Levels: ObservableObject {
+    @Published var ch = [ChannelLevel(), ChannelLevel()]
 }
 
 final class Meter: ObservableObject {
-    @Published var ch = [ChannelLevel(), ChannelLevel()]
+    let levels = Levels()
+    @Published var anyClip = false
+    private var ch = [ChannelLevel(), ChannelLevel()]
+    // the IOProc folds its peaks in here; a 30 Hz timer on the main thread drains them
+    private let peakLock = NSLock()
+    private var pending: [Float] = [0, 0]
+    private var ticker: Timer?
     @Published var status = "Waiting for microphone access"
     @Published var live = false
 
@@ -112,6 +127,10 @@ final class Meter: ObservableObject {
             DispatchQueue.main.async {
                 guard ok else { self.status = "Allow microphone access for VoltMeter in System Settings"; return }
                 self.startEngine()
+                let t = Timer(timeInterval: 1.0 / 30, repeats: true) { _ in self.tick() }
+                t.tolerance = 0.005
+                RunLoop.main.add(t, forMode: .common)
+                self.ticker = t
                 // re-attach if the Volt is unplugged and plugged back in
                 self.watchdog = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { _ in
                     if self.voltDeviceID() != self.device || self.device == 0 { self.startEngine() }
@@ -120,7 +139,17 @@ final class Meter: ObservableObject {
         }
     }
 
-    func resetClips() { for i in ch.indices { ch[i].clipped = false } }
+    func resetClips() {
+        for i in ch.indices { ch[i].clipped = false }
+        levels.ch = ch
+        anyClip = false
+    }
+
+    private func tick() {
+        guard live else { return }
+        peakLock.lock(); let peaks = pending; pending = [0, 0]; peakLock.unlock()
+        update(peaks: peaks)
+    }
 
     private func voltDeviceID() -> AudioDeviceID? {
         var addr = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDevices,
@@ -177,7 +206,9 @@ final class Meter: ObservableObject {
             if ProcessInfo.processInfo.environment["VM_DEBUG"] != nil {
                 FileHandle.standardError.write("bufs=\(abl.count) ch=\(abl.first?.mNumberChannels ?? 0) bytes=\(abl.first?.mDataByteSize ?? 0) peaks=\(peaks)\n".data(using: .utf8)!)
             }
-            DispatchQueue.main.async { self.update(peaks: peaks) }
+            self.peakLock.lock()
+            self.pending[0] = max(self.pending[0], peaks[0]); self.pending[1] = max(self.pending[1], peaks[1])
+            self.peakLock.unlock()
         }
         guard err == noErr, let proc else { status = "Audio error \(err)"; return }
         let startErr = AudioDeviceStart(dev, proc)
@@ -252,6 +283,11 @@ final class Meter: ObservableObject {
             if peaks[c] >= clipLevel { l.clipped = true }
             ch[c] = l
         }
+        let clip = ch.contains { $0.clipped }
+        if clip != anyClip { anyClip = clip }
+        // nothing to draw when the panel is hidden or covered, or when nothing visibly moved
+        guard FloatingPanel.shared.isOnScreen else { return }
+        if ch.map(\.displayKey) != levels.ch.map(\.displayKey) { levels.ch = ch }
     }
 }
 
@@ -554,12 +590,7 @@ struct Faceplate: View {
             Rectangle().fill(Palette.rule).frame(height: u(1))
 
             VStack(spacing: u(10)) {
-                ChannelRow(index: 1, level: meter.ch[0], live: meter.live, vintage: panel.vintage1, inst: panel.inst1,
-                           enabled: ok, reset: meter.resetClips,
-                           toggleVintage: { panel.toggle(0x40) }, toggleInst: { panel.toggle(0x10) })
-                ChannelRow(index: 2, level: meter.ch[1], live: meter.live, vintage: panel.vintage2, inst: panel.inst2,
-                           enabled: ok, reset: meter.resetClips,
-                           toggleVintage: { panel.toggle(0x80) }, toggleInst: { panel.toggle(0x20) })
+                InputRows(levels: meter.levels, live: meter.live, enabled: ok, reset: meter.resetClips)
                 Card {
                     HStack(spacing: u(18)) {
                         Text("Phantom Power").font(.ui(20, .semibold)).foregroundStyle(Palette.ink)
@@ -580,10 +611,29 @@ struct Faceplate: View {
     }
 }
 
+/// The two input rows. Only this view observes the live levels.
+struct InputRows: View {
+    @ObservedObject var levels: Levels
+    @EnvironmentObject var panel: VoltPanel
+    let live: Bool
+    let enabled: Bool
+    let reset: () -> Void
+
+    var body: some View {
+        ChannelRow(index: 1, level: levels.ch[0], live: live, vintage: panel.vintage1, inst: panel.inst1,
+                   enabled: enabled, reset: reset,
+                   toggleVintage: { panel.toggle(0x40) }, toggleInst: { panel.toggle(0x10) })
+        ChannelRow(index: 2, level: levels.ch[1], live: live, vintage: panel.vintage2, inst: panel.inst2,
+                   enabled: enabled, reset: reset,
+                   toggleVintage: { panel.toggle(0x80) }, toggleInst: { panel.toggle(0x20) })
+    }
+}
+
 final class FloatingPanel {
     static let shared = FloatingPanel()
     private var window: NSPanel?
     var isVisible: Bool { window?.isVisible ?? false }
+    var isOnScreen: Bool { guard let w = window else { return false }; return w.isVisible && w.occlusionState.contains(.visible) }
 
     static let sizes: [CGFloat] = [1, 1.5, 2]
     static var scale: CGFloat {
@@ -657,7 +707,7 @@ final class FloatingPanel {
 struct MenuIcon: View {
     @ObservedObject var meter: Meter
     var body: some View {
-        Image(systemName: meter.ch.contains(where: { $0.clipped }) ? "exclamationmark.triangle.fill" : "gauge.with.needle")
+        Image(systemName: meter.anyClip ? "exclamationmark.triangle.fill" : "gauge.with.needle")
     }
 }
 
